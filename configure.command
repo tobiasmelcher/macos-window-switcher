@@ -8,23 +8,21 @@ fi
 
 switcher_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cat <<'SETUP'
-1. In Shortcuts, create "Switch window" with a "Run Shell Script" action.
-2. Paste the command below. Leave "Run as Administrator" off.
-3. In Details, enable "Use as Quick Action > Services Menu".
-4. Deselect all input types. With no input, choose "Continue".
-5. Assign Command + Control + Shift + W.
-6. Run once. If scripting is disabled, enable Shortcuts > Settings >
-   Advanced > Allow Running Scripts.
+Setup:
+1. In System Settings > Privacy & Security > Accessibility, enable the
+   app running this helper (Terminal or Ghostty). If missing, click +
+   and select it from Applications. Approve the macOS prompt manually.
+2. Start the native listener with ./switch.command start.
 
-In System Settings > Privacy & Security > Accessibility, enable the app
-from which you invoke the shortcut, for example Teams, Eclipse, or Ghostty.
-Enable Shortcuts if you run it there. If missing, click + and select the app.
-macOS requires you to approve this permission manually.
-System Events Automation permission is no longer needed.
-
-See README.md for usage and troubleshooting.
+The listener registers Command + Control + Shift + W system-wide.
+Shortcuts and per-app permission setup are no longer needed.
+Start it once after each login. It runs in the background.
+Use ./switch.command stop to stop it, or status to check it.
 SETUP
 
-printf '\nShell action command:\n/bin/sh "%s/switch.command"\n\n' "$switcher_dir"
-/usr/bin/open -a Shortcuts
 /usr/bin/open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'
+if [ -t 0 ]; then
+    printf '\nAfter enabling Accessibility, return here and press Return to start: '
+    IFS= read -r setup_continue || exit 0
+    /bin/sh "$switcher_dir/switch.command" start
+fi

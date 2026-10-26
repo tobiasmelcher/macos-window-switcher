@@ -2,8 +2,31 @@
 ObjC.import('AppKit');
 ObjC.import('Foundation');
 ObjC.import('ApplicationServices');
+ObjC.import('Carbon');
 
 var picker = null;
+var applicationStarted = false;
+
+// W on the macOS ANSI keyboard; Command + Control + Shift.
+var HOTKEY = {keyCode: 13, modifiers: 256 | 4096 | 512};
+
+function prepareApplication() {
+    var app = $.NSApplication.sharedApplication;
+    if (!applicationStarted) {
+        app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
+        app.finishLaunching;
+        applicationStarted = true;
+    }
+    return app;
+}
+
+function closePicker() {
+    picker.window.orderOut($());
+    picker.window.delegate = $();
+    picker.window.close;
+    picker = null;
+}
+
 
 function selectedItem() {
     var row = Number(picker.table.selectedRow);
@@ -51,7 +74,7 @@ ObjC.registerSubclass({
     methods: {
         'isEmphasized': {
             types: ['bool', []],
-            implementation: function () { return !!picker.window.keyWindow; }
+            implementation: function () { return !!(picker && picker.window.keyWindow); }
         }
     }
 });
@@ -150,9 +173,7 @@ function buildPicker(labels, activeIndex) {
     var screen = $.NSScreen.mainScreen.visibleFrame;
     var width = Math.min(950, Number(screen.size.width) - 60);
     var height = Math.min(520, Number(screen.size.height) - 80);
-    var app = $.NSApplication.sharedApplication;
-    app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
-    app.finishLaunching;
+    var app = prepareApplication();
     picker = {
         items: labels.map(function (text, index) { return {label: text, search: text.toLocaleLowerCase(), index: index}; }),
         width: width, height: height, result: 0
@@ -272,9 +293,7 @@ function focusWindow(target) {
 }
 
 function showMessage(title, detail) {
-    var app = $.NSApplication.sharedApplication;
-    app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
-    app.finishLaunching;
+    var app = prepareApplication();
     var alert = $.NSAlert.alloc.init;
     alert.messageText = $(title);
     alert.informativeText = $(detail);
@@ -285,6 +304,8 @@ function showMessage(title, detail) {
 
 function run(argv) {
     if (argv[0] === '--check') return checkPicker(argv[1]);
+    if (argv[0] === '--check-listener') return checkHotkey();
+    if (argv[0] === '--listen') return listen();
     var snapshot = collectWindows();
     if (argv[0] === '--check-focus') {
         if (!snapshot.activeFound) throw Error('The current focused window was not exposed by its app.');
@@ -307,6 +328,11 @@ function run(argv) {
         }
         return 'Window checks passed: ' + snapshot.entries.length + ' distinct windows; active index ' + snapshot.activeIndex;
     }
+    showSwitcher(snapshot);
+}
+
+function showSwitcher(snapshot) {
+    snapshot = snapshot || collectWindows();
     if (!snapshot.entries.length) {
         showMessage('Switch window', 'No accessible windows found.');
         return;
@@ -317,14 +343,99 @@ function run(argv) {
     $.NSRunningApplication.currentApplication.activateWithOptions($.NSApplicationActivateIgnoringOtherApps);
     picker.window.makeFirstResponder(picker.input);
     app.runModalForWindow(picker.window);
-    picker.window.orderOut($());
-    if (!picker.result) return;
+    var result = picker.result;
+    closePicker();
+    if (!result) return;
     try {
-        focusWindow(snapshot.entries[picker.result - 1]);
+        focusWindow(snapshot.entries[result - 1]);
     } catch (error) {
         showMessage('Could not focus that window', String(error));
     }
     // No result text: Shortcuts should not display an Accessibility object.
+}
+
+// Carbon registers one global hotkey without monitoring general keyboard input.
+// Polling its event queue avoids JXA's unreliable native C/block callbacks.
+function registerHotkey() {
+    var output = Ref();
+    var code = Number($.RegisterEventHotKey(HOTKEY.keyCode, HOTKEY.modifiers,
+        {signature: 0x57535754, id: 1}, $.GetApplicationEventTarget(), 0, output));
+    if (code !== 0) throw Error('Cannot register Command + Control + Shift + W. Another global shortcut may already use it (macOS error ' + code + ').');
+    return output[0];
+}
+
+function receiveHotkey(timeout, onHotkey) {
+    var output = Ref();
+    var code = Number($.ReceiveNextEvent(0, null, timeout, true, output));
+    if (code === Number($.eventLoopTimedOutErr)) return false;
+    // AppKit can leave a quit notification after its modal/startup loop.
+    // Re-entering the native loop clears it; the background listener continues.
+    if (code === Number($.eventLoopQuitErr)) {
+        $.RunCurrentEventLoop(0);
+        return false;
+    }
+    if (code !== 0) throw Error('Cannot receive hotkey events (macOS error ' + code + ').');
+    var event = output[0];
+    try {
+        if (Number($.GetEventClass(event)) === Number($.kEventClassKeyboard) &&
+            Number($.GetEventKind(event)) === Number($.kEventHotKeyPressed)) {
+            onHotkey();
+            return true;
+        }
+        $.SendEventToEventTarget(event, $.GetEventDispatcherTarget());
+        return false;
+    } finally {
+        $.ReleaseEvent(event);
+    }
+}
+
+function listen() {
+    // A new session keeps the background listener alive when its launcher exits.
+    // No helper executable or launch-agent installation is required.
+    ObjC.bindFunction('setsid', ['int', []]);
+    $.setsid();
+    // Fail immediately rather than leaving an unusable background listener.
+    if (!$.AXIsProcessTrusted()) throw Error('Enable Accessibility for the app starting the listener (Terminal or Ghostty), then run ./switch.command start again.');
+    prepareApplication();
+    var registration = registerHotkey();
+    try {
+        console.log('READY: Command + Control + Shift + W');
+        while (true) {
+            receiveHotkey(0.25, function () {
+                console.log('HOTKEY: opening window chooser');
+                try { showSwitcher(); } catch (error) { showMessage('Switch window', String(error)); }
+            });
+        }
+    } finally {
+        $.UnregisterEventHotKey(registration);
+    }
+}
+
+function checkHotkey() {
+    prepareApplication();
+    var registration = registerHotkey();
+    var received = 0;
+    try {
+        $.QuitEventLoop($.GetCurrentEventLoop());
+        receiveHotkey(0, function () { throw Error('Unexpected test event.'); });
+        for (var attempt = 0; attempt < 2; attempt++) {
+            // Post to this process only; never inject keys into other apps.
+            var event = Ref();
+            var code = Number($.CreateEvent(null, $.kEventClassKeyboard, $.kEventHotKeyPressed,
+                $.GetCurrentEventTime(), 0, event));
+            if (code !== 0) throw Error('Cannot create a test hotkey event: ' + code);
+            try { $.PostEventToQueue($.GetMainEventQueue(), event[0], $.kEventPriorityStandard); }
+            finally { $.ReleaseEvent(event[0]); }
+            var deadline = Date.now() + 5000;
+            while (received <= attempt && Date.now() < deadline) {
+                receiveHotkey(0.1, function () { checkPicker(); received++; });
+            }
+            if (received <= attempt) throw Error('Hotkey event was not delivered.');
+        }
+        return 'Listener checks passed: global registration, native event delivery, two chooser cycles, keyboard/filtering';
+    } finally {
+        $.UnregisterEventHotKey(registration);
+    }
 }
 
 // Exercise real AppKit keyboard events against sample windows only.
@@ -397,7 +508,7 @@ function checkPicker(outputPath) {
         if (picker.checkError) throw Error(picker.checkError);
         return 'Chooser checks passed: focus, typing, deletion, filtering, arrows, Return, Escape';
     } finally {
-        picker.window.orderOut($());
+        closePicker();
         previousApp.activateWithOptions($.NSApplicationActivateIgnoringOtherApps);
     }
 }
